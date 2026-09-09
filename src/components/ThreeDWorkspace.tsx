@@ -1,8 +1,9 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 
 export const ThreeDWorkspace: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null);
+  const [webglFailed, setWebglFailed] = useState(false);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -11,15 +12,48 @@ export const ThreeDWorkspace: React.FC = () => {
     // Check prefers-reduced-motion
     const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    // Scene setup
+    // ============================================================
+    // Scene + Camera
+    // ============================================================
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
-    camera.position.set(0, 1.2, 5.5);
+    // Explicit dark professional background so the viewport is never
+    // transparent/blank even before any geometry is in frame.
+    scene.background = new THREE.Color(0x0b1220);
 
-    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'high-performance' });
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      // Guard against a 0-height container at mount (avoids NaN aspect).
+      (container.clientWidth || 1) / (container.clientHeight || 1),
+      0.1,
+      1000
+    );
+    camera.position.set(0, 0.8, 6);
+    camera.lookAt(0, 0, 0);
+
+    // ============================================================
+    // Renderer (opaque, reliable). Created once; disposed on cleanup.
+    // ============================================================
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        alpha: false,
+        antialias: true,
+        powerPreference: 'high-performance',
+      });
+    } catch (err) {
+      // Only surface a fallback if the WebGL renderer genuinely fails.
+      console.error('WebGL renderer creation failed:', err);
+      setWebglFailed(true);
+      return;
+    }
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.shadowMap.enabled = false; // keep fast
+    renderer.domElement.style.display = 'block';
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
     container.appendChild(renderer.domElement);
 
     // Group for overall rotation & parallax
@@ -38,13 +72,13 @@ export const ThreeDWorkspace: React.FC = () => {
     const chassisMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
       metalness: 0.8,
-      roughness: 0.25
+      roughness: 0.25,
     });
 
     const screenFrameMat = new THREE.MeshStandardMaterial({
       color: 0x0f172a,
       metalness: 0.9,
-      roughness: 0.2
+      roughness: 0.2,
     });
 
     // Base
@@ -78,6 +112,8 @@ export const ThreeDWorkspace: React.FC = () => {
     lidGroup.add(lidMesh);
 
     // Dynamic Canvas Texture for Laptop Screen (Power BI & Python Analytics Display)
+    // NOTE: This is a separate 2D <canvas> used only as a texture source — it is
+    // not the Three.js renderer canvas and does not add a context to it.
     const screenCanvas = document.createElement('canvas');
     screenCanvas.width = 512;
     screenCanvas.height = 320;
@@ -143,6 +179,7 @@ export const ThreeDWorkspace: React.FC = () => {
     }
 
     const screenTexture = new THREE.CanvasTexture(screenCanvas);
+    screenTexture.colorSpace = THREE.SRGBColorSpace;
     const screenMat = new THREE.MeshBasicMaterial({ map: screenTexture });
     const screenGeo = new THREE.PlaneGeometry(2.25, 1.35);
     screenGeo.translate(0, 0.75, 0.027);
@@ -161,11 +198,11 @@ export const ThreeDWorkspace: React.FC = () => {
       metalness: 0.6,
       roughness: 0.3,
       transparent: true,
-      opacity: 0.9
+      opacity: 0.9,
     });
 
     const ringGlowMat = new THREE.MeshBasicMaterial({
-      color: 0x10b981
+      color: 0x10b981,
     });
 
     // 3 stacked database platters
@@ -193,7 +230,7 @@ export const ThreeDWorkspace: React.FC = () => {
       transmission: 0.7,
       thickness: 0.5,
       transparent: true,
-      opacity: 0.85
+      opacity: 0.85,
     });
 
     const emeraldMat = new THREE.MeshPhysicalMaterial({
@@ -202,7 +239,13 @@ export const ThreeDWorkspace: React.FC = () => {
       roughness: 0.2,
       transmission: 0.6,
       transparent: true,
-      opacity: 0.8
+      opacity: 0.8,
+    });
+
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      metalness: 0.7,
+      roughness: 0.2,
     });
 
     // Octahedron node
@@ -219,11 +262,7 @@ export const ThreeDWorkspace: React.FC = () => {
 
     // Floating small sphere
     const sphereGeo = new THREE.SphereGeometry(0.18, 24, 24);
-    const sphereMesh = new THREE.Mesh(sphereGeo, new THREE.MeshStandardMaterial({
-      color: 0x38bdf8,
-      metalness: 0.7,
-      roughness: 0.2
-    }));
+    const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
     sphereMesh.position.set(-1.5, -0.8, 0.8);
     mainGroup.add(sphereMesh);
 
@@ -261,21 +300,35 @@ export const ThreeDWorkspace: React.FC = () => {
 
     window.addEventListener('mousemove', handleMouseMove);
 
-    // Resize Handler
-    const handleResize = () => {
-      if (!container) return;
-      camera.aspect = container.clientWidth / container.clientHeight;
+    // ============================================================
+    // 6. Robust resizing — always feed the renderer the *actual*
+    //    container size. ResizeObserver catches layout/reflow changes
+    //    that a window 'resize' listener alone would miss (the original
+    //    bug: the canvas never learned its real size in production).
+    // ============================================================
+    const applySize = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width === 0 || height === 0) return;
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setSize(width, height);
+      renderer.render(scene, camera);
     };
 
-    window.addEventListener('resize', handleResize);
+    const resizeObserver = new ResizeObserver(() => applySize());
+    resizeObserver.observe(container);
+    window.addEventListener('resize', applySize);
+
+    // Guaranteed first render (before the RAF loop starts).
+    applySize();
+    renderer.render(scene, camera);
 
     // ============================================================
-    // 6. Animation Loop (Smooth Spring Damping)
+    // 7. Animation Loop (Smooth Spring Damping)
     // ============================================================
-    let animationFrameId: number;
-    let clock = new THREE.Clock();
+    let animationFrameId = 0;
+    const clock = new THREE.Clock();
 
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
@@ -306,15 +359,37 @@ export const ThreeDWorkspace: React.FC = () => {
 
     animate();
 
-    // Cleanup
+    // ============================================================
+    // 8. Cleanup — dispose everything so the single renderer/context
+    //    is released and no GPU resources leak across remounts.
+    // ============================================================
     return () => {
       cancelAnimationFrame(animationFrameId);
+      resizeObserver.disconnect();
       window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('resize', applySize);
+
+      // Dispose geometries, materials and textures held by the scene.
+      scene.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.isMesh) {
+          mesh.geometry?.dispose();
+          const material = mesh.material;
+          const materials = Array.isArray(material) ? material : [material];
+          materials.forEach((m) => {
+            const withMap = m as THREE.MeshBasicMaterial;
+            withMap.map?.dispose();
+            m.dispose();
+          });
+        }
+      });
+      screenTexture.dispose();
+
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
       renderer.dispose();
+      renderer.forceContextLoss();
     };
   }, []);
 
@@ -323,6 +398,14 @@ export const ThreeDWorkspace: React.FC = () => {
       ref={mountRef}
       className="w-full h-[360px] sm:h-[440px] lg:h-[500px] relative pointer-events-auto cursor-grab active:cursor-grabbing"
       aria-label="Interactive 3D Developer Workspace"
-    />
+    >
+      {webglFailed && (
+        <div className="absolute inset-0 flex items-center justify-center rounded-3xl bg-slate-950 text-center p-6">
+          <p className="text-sm text-slate-300">
+            3D preview unavailable — your browser or device could not initialize WebGL.
+          </p>
+        </div>
+      )}
+    </div>
   );
 };
